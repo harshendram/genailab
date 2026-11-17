@@ -1,3 +1,4 @@
+const chalk = require("chalk");
 const { analyzeEmails: analyzeEmailsAI } = require("../ai/geminiAI");
 
 /**
@@ -40,32 +41,16 @@ async function analyzeEmail(email) {
  * @returns {Promise<Array>} Array of analyzed emails
  */
 async function analyzeEmails(emails) {
-  console.log(`Analyzing ${emails.length} emails...`);
-
-  // Process emails in batches to avoid overwhelming the AI service
-  const batchSize = 3;
-  const analyzedEmails = [];
-
-  for (let i = 0; i < emails.length; i += batchSize) {
-    const batch = emails.slice(i, i + batchSize);
-    const batchResults = await Promise.all(batch.map(analyzeEmail));
-    analyzedEmails.push(...batchResults);
-
-    console.log(
-      `Analyzed ${Math.min(i + batchSize, emails.length)} of ${
-        emails.length
-      } emails`
-    );
-  }
+  // One call for all emails: the AI module groups them into batches itself
+  // (config batchSize per request), instead of 3 requests per email.
+  const analyzedEmails = await analyzeEmailsAI(emails, (step, batchNum, totalBatches) => {
+    console.log(chalk.gray(`  ${step}: batch ${batchNum}/${totalBatches}`));
+  });
 
   // Sort emails by priority
-  return analyzedEmails.sort((a, b) => {
-    const priorityOrder = { Urgent: 0, Important: 1, Normal: 2 };
-    return (
-      priorityOrder[a.classification.priority] -
-      priorityOrder[b.classification.priority]
-    );
-  });
+  const priorityOrder = { Urgent: 0, Important: 1, Normal: 2 };
+  const rank = (email) => priorityOrder[email.classification && email.classification.priority] ?? 2;
+  return analyzedEmails.sort((a, b) => rank(a) - rank(b));
 }
 
 /**
@@ -88,24 +73,26 @@ function generateDailySummary(analyzedEmails) {
   const timeSensitiveEmails = [];
 
   analyzedEmails.forEach((email) => {
-    const priority = email.classification.priority;
+    const classification = email.classification || {};
+    const priority = classification.priority in priorityCounts ? classification.priority : "Normal";
     priorityCounts[priority]++;
 
-    if (email.classification.actionRequired) {
+    if (classification.actionRequired) {
       actionableEmails.push({
         subject: email.subject,
         from: email.from,
         priority,
-        actionItems: email.classification.actionItems,
+        actionItems: classification.actionItems || [],
       });
     }
 
-    if (email.summary.deadlines && email.summary.deadlines.length > 0) {
+    const deadlines = (email.summary && email.summary.deadlines) || [];
+    if (deadlines.length > 0) {
       timeSensitiveEmails.push({
         subject: email.subject,
         from: email.from,
         priority,
-        deadlines: email.summary.deadlines,
+        deadlines,
       });
     }
   });

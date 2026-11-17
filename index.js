@@ -4,6 +4,15 @@
  * EmailMaster CLI
  * A modern CLI tool for managing Gmail emails with AI capabilities
  */
+
+// Remember where the user ran the command from, then work from the app folder
+// so credentials.json, .env, tokens/ and the email cache are found no matter
+// which directory the terminal is in. This must run before the requires below,
+// because some modules resolve their file paths at load time.
+const USER_CWD = process.cwd();
+const APP_DIR = __dirname;
+process.chdir(APP_DIR);
+
 const { program } = require("commander");
 const { fetchEmails } = require("./src/fetcher/emailFetcher");
 const { getGmailClient } = require("./src/auth/gmailAuth");
@@ -66,6 +75,7 @@ const {
   updateConfig: updateConfigUtils,
 } = require("./src/utils/configUtils");
 const { replyToEmail } = require("./src/utils/replyUtils");
+const { getProviderInfo, listModels } = require("./src/ai/aiProvider");
 const {
   fetchAttachments,
   syncAttachments,
@@ -90,6 +100,20 @@ require("dotenv").config();
 
 // Define directories
 const REPORTS_DIR = path.join(__dirname, "reports");
+
+/**
+ * Resolve a file/folder option to an absolute path. A path the user typed is
+ * relative to the folder they ran the command from; a default value is
+ * relative to the app folder.
+ * @param {import("commander").Command} cmd Command whose option to resolve
+ * @param {string} optionName Option attribute name (e.g. "output")
+ * @returns {string} Absolute path
+ */
+function resolveUserPath(cmd, optionName) {
+  const value = cmd.getOptionValue(optionName);
+  const base = cmd.getOptionValueSource(optionName) === "cli" ? USER_CWD : APP_DIR;
+  return path.resolve(base, value);
+}
 
 /**
  * Display modern ASCII art only for authentication success
@@ -132,28 +156,35 @@ program
   .option("--batch-size <number>", "Set batch size for API calls", parseInt)
   .option(
     "--model <model>",
-    "Set AI model (gemini-2.0-flash, gemini-1.5-pro, gemini-1.5-flash)"
+    "Set the AI model (Azure deployment name, or Gemini model)"
   )
   .option("--temp-dir <path>", "Set temporary directory path")
   .option("--show", "Show current configuration")
   .option("--list-models", "List available AI models")
   .action(async (options) => {
     try {
+      const provider = getProviderInfo();
+
       if (options.listModels) {
         console.log(createTitleBox("🤖 Available AI Models"));
-        console.log(chalk.bold("Google Gemini Models:"));
-        console.log("  • gemini-2.0-flash (Default - Fastest)");
-        console.log("  • gemini-1.5-pro (Most capable)");
-        console.log("  • gemini-1.5-flash (Balanced speed/quality)");
-        console.log(
-          chalk.gray("\nNote: Claude and OpenAI support coming soon")
-        );
+        console.log(chalk.bold(`${provider.label} models available to your key:`));
+        const models = await listModels();
+        models.forEach((name) => {
+          const current = name === provider.model;
+          console.log(`  ${current ? chalk.green("●") : "•"} ${name}${current ? chalk.green(" (in use)") : ""}`);
+        });
+        console.log(chalk.gray("\nSwitch with: emailmaster config --model <name>"));
         return;
       }
 
       if (options.show) {
         const config = await loadConfig();
         console.log(createTitleBox("⚙️ EmailMaster Configuration"));
+        console.log(
+          chalk.bold("AI provider: ") +
+            `${provider.label} (${provider.model})` +
+            (provider.configured ? "" : chalk.yellow(`  not configured: ${provider.setupHint}`))
+        );
         console.log(chalk.bold("Current Configuration:"));
         console.log(JSON.stringify(config, null, 2));
         return;
@@ -161,7 +192,7 @@ program
 
       const updates = {};
       if (options.batchSize) updates.batchSize = options.batchSize;
-      if (options.model) updates.model = options.model;
+      if (options.model) updates[provider.modelConfigKey] = options.model;
       if (options.tempDir) updates.tempDir = options.tempDir;
 
       if (Object.keys(updates).length === 0) {
@@ -369,7 +400,7 @@ program
       if (options.notify) {
         await showLoading("Sending notifications", 800);
         const urgentEmails = analyzedEmails.filter(
-          (email) => email.priority === "high"
+          (email) => email.classification && email.classification.priority === "Urgent"
         );
         if (urgentEmails.length > 0) {
           await sendNotifications(urgentEmails);
@@ -690,8 +721,9 @@ program
   .option("--email <number>", "Extract from specific email number")
   .option("--file <path>", "Output ICS file path", "events.ics")
   .option("--all", "Extract from all analyzed emails")
-  .action(async (options) => {
+  .action(async (options, cmd) => {
     try {
+      options.file = resolveUserPath(cmd, "file");
       console.log(createTitleBox("📅 Calendar Export"));
 
       // Ensure account exists
@@ -741,16 +773,11 @@ program
         return;
       }
 
-      // Generate ICS file
-      const icsContent = await generateICSFile(calendarEvents);
-
-      // Save to file
-      await fs.writeFile(options.file, icsContent);
+      // Write the ICS file to --file (default: events.ics in the app folder)
+      const ics = await generateICSFile(calendarEvents, options.file);
 
       console.log(
-        createSuccessMessage(
-          `Exported ${calendarEvents.length} calendar events to: ${options.file}`
-        )
+        createSuccessMessage(`Exported ${ics.count} calendar events to: ${ics.path}`)
       );
       console.log(
         createInfoMessage(
@@ -762,7 +789,7 @@ program
       console.log(chalk.bold("\n📅 Extracted Events:"));
       calendarEvents.forEach((event, index) => {
         console.log(
-          `${index + 1}. ${chalk.cyan(event.summary)} - ${event.start}`
+          `${index + 1}. ${chalk.cyan(event.title || "Event")} - ${event.date || "no date"}${event.time ? " " + event.time : ""}`
         );
       });
     } catch (error) {
@@ -1140,7 +1167,7 @@ program
       if (!aiConfig.configured) {
         console.log(
           chalk.yellow(
-            "⚠️  Gemini AI not configured. Using simple text search."
+            "⚠️  AI provider not configured. Using simple text search."
           )
         );
         console.log(chalk.gray(`💡 Tip: ${aiConfig.setupInstructions}`));
@@ -1322,8 +1349,9 @@ program
   .option("--max-size <size>", "Maximum file size in MB", "25")
   .option("--no-organize-date", "Don't organize files by date")
   .option("--no-organize-type", "Don't organize files by type")
-  .action(async (options) => {
+  .action(async (options, cmd) => {
     try {
+      options.output = resolveUserPath(cmd, "output");
       console.log(createTitleBox("📎 Fetching Email Attachments"));
 
       // Ensure account exists, prompt for auth if needed
@@ -1458,11 +1486,16 @@ program
   .option("--max-size <size>", "Maximum file size in MB", "25")
   .option("--no-organize-date", "Don't organize files by date")
   .option("--no-organize-type", "Don't organize files by type")
-  .action(async (options) => {
+  .action(async (options, cmd) => {
     try {
+      options.output = resolveUserPath(cmd, "output");
       console.log(createTitleBox("🔄 Syncing Email Attachments"));
 
-      const auth = await getGmailClient();
+      await ensureAccount();
+      const currentAccount = await getCurrentAccount();
+      const auth = await getGmailClient(
+        path.join(process.cwd(), currentAccount.tokenPath)
+      );
       if (!auth) {
         console.error(
           createErrorMessage(
@@ -1477,7 +1510,7 @@ program
 
       try {
         // Fetch all emails (we'll filter by date in sync function)
-        const emails = await fetchEmails(auth, 365); // Look back 1 year
+        const emails = await fetchEmails(500); // Gmail API max per request
         clearInterval(loadingInterval);
 
         // Prepare options
@@ -1534,8 +1567,9 @@ program
   .command("attachments-stats")
   .description("View attachment statistics")
   .option("-o, --output <path>", "Attachments directory", "./attachments")
-  .action(async (options) => {
+  .action(async (options, cmd) => {
     try {
+      options.output = resolveUserPath(cmd, "output");
       console.log(createTitleBox("📊 Attachment Statistics"));
 
       const stats = await getAttachmentStats(options.output);
@@ -1632,10 +1666,18 @@ program.on("command:*", function () {
   process.exit(1);
 });
 
-// Parse arguments
-program.parse(process.argv);
-
-// If no arguments provided, show help
-if (!process.argv.slice(2).length) {
-  program.outputHelp();
+// With no arguments in a real terminal, open the interactive shell;
+// when piped/scripted, show help; otherwise run the given command.
+if (process.argv.slice(2).length === 0) {
+  if (process.stdin.isTTY && process.stdout.isTTY) {
+    require("./src/ui/interactiveShell").startShell(program, {
+      entryFile: __filename,
+      appDir: APP_DIR,
+      userCwd: USER_CWD,
+    });
+  } else {
+    program.outputHelp();
+  }
+} else {
+  program.parse(process.argv);
 }

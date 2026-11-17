@@ -31,8 +31,8 @@ temp/*
 # =================
 reports/*
 !reports/.gitkeep
-attachments/
-test-attachments/
+/attachments/
+/test-attachments/
 
 # Test Files and Documentation
 # =============================

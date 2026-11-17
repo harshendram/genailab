@@ -1,93 +1,186 @@
-const { GoogleGenerativeAI } = require("@google/generative-ai");
+/**
+ * AI features: classification, summaries, replies, calendar events, search,
+ * tagging, sentiment and follow-up checks.
+ *
+ * All model calls go through ./aiProvider (Azure OpenAI or Google Gemini),
+ * which handles rate limits and retries. This module builds the prompts,
+ * parses the JSON replies and maps results back to emails.
+ * (The file keeps its historical name so existing imports keep working.)
+ */
 const fs = require("fs-extra");
 const path = require("path");
-require("dotenv").config();
+const chalk = require("chalk");
+const { generate, getProviderInfo } = require("./aiProvider");
 
-// Load configuration dynamically
+const MAX_CONTENT_CHARS = 4000; // per email sent to the model
+
+// ---------- configuration ----------
+
 function loadConfig() {
   const configPath = path.join(__dirname, "../../config.json");
-  if (fs.existsSync(configPath)) {
-    return JSON.parse(fs.readFileSync(configPath, "utf8"));
+  let config = {};
+  try {
+    if (fs.existsSync(configPath)) {
+      const raw = fs.readFileSync(configPath, "utf8").trim();
+      if (raw) config = JSON.parse(raw);
+    }
+  } catch {
+    // malformed config.json: use defaults
   }
-  // Return default config if no config file exists
+  return { tempDir: "./temp", ...config, batchSize: Number(config.batchSize) || 20 };
+}
+
+/**
+ * Check if an AI provider is configured
+ * @returns {Object} Configuration status
+ */
+function checkAIConfiguration() {
+  const info = getProviderInfo();
   return {
-    batchSize: 20,
-    model: "gemini-2.0-flash-exp",
-    tempDir: "./temp",
+    configured: info.configured,
+    provider: info.label,
+    model: info.model,
+    apiKey: info.configured ? "✓ Set" : "✗ Missing",
+    setupInstructions: info.configured ? null : info.setupHint,
   };
 }
 
-// Initialize Gemini API
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+// ---------- JSON parsing ----------
 
-// Get model instance with current configuration
-function getModel() {
-  const config = loadConfig();
-  const modelName = config.model || "gemini-2.0-flash-exp";
-  return genAI.getGenerativeModel({
-    model: modelName,
-  });
+/**
+ * Index of the bracket that closes the one at `start`, respecting strings
+ */
+function findClosingBracket(text, start) {
+  const stack = [];
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === "[" || ch === "{") stack.push(ch === "[" ? "]" : "}");
+    else if (ch === "]" || ch === "}") {
+      if (stack.pop() !== ch) return -1;
+      if (stack.length === 0) return i;
+    }
+  }
+  return -1;
 }
 
-// Enhanced JSON parsing with better error handling
-function parseAIResponse(response) {
+/**
+ * Pull the first JSON value out of a model reply (handles code fences and
+ * surrounding prose). Returns null if none parses.
+ */
+function extractJSON(text) {
+  if (typeof text !== "string") return null;
+  let body = text.trim().replace(/^﻿/, "");
+  const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(body);
+  if (fenced) body = fenced[1].trim();
+
   try {
-    // Extract JSON from response - try arrays first, then objects
-    let jsonMatch = response.match(/\[[\s\S]*?\]/);
+    return JSON.parse(body);
+  } catch {
+    // fall through to bracket matching
+  }
 
-    if (!jsonMatch) {
-      // Try to find JSON within code blocks
-      jsonMatch = response.match(/```(?:json)?\s*(\[[\s\S]*?\])\s*```/);
-      if (jsonMatch) {
-        jsonMatch[0] = jsonMatch[1];
-      }
+  const start = body.search(/[[{]/);
+  if (start === -1) return null;
+  const end = findClosingBracket(body, start);
+  if (end === -1) return null;
+  const candidate = body.slice(start, end + 1);
+  try {
+    return JSON.parse(candidate);
+  } catch {
+    try {
+      return JSON.parse(
+        candidate
+          .replace(/[“”]/g, '"')
+          .replace(/,(\s*[}\]])/g, "$1")
+      );
+    } catch {
+      return null;
     }
-
-    if (!jsonMatch) {
-      // Try to find single object and wrap in array
-      jsonMatch = response.match(/\{[\s\S]*?\}/);
-      if (jsonMatch) {
-        jsonMatch[0] = `[${jsonMatch[0]}]`;
-      }
-    }
-
-    if (!jsonMatch) {
-      throw new Error("No JSON found in response");
-    }
-
-    let jsonStr = jsonMatch[0];
-
-    // Clean up common issues with AI responses
-    jsonStr = jsonStr
-      .replace(/[\u201C\u201D]/g, '"') // Replace smart quotes
-      .replace(/[\u2018\u2019]/g, "'") // Replace smart single quotes
-      .replace(/\n/g, " ") // Replace newlines with spaces
-      .replace(/\s+/g, " ") // Collapse multiple spaces
-      .replace(/,(\s*[}\]])/g, "$1") // Remove trailing commas
-      .trim();
-
-    // Try to parse the cleaned JSON
-    const parsed = JSON.parse(jsonStr);
-    return Array.isArray(parsed) ? parsed : [parsed];
-  } catch (error) {
-    console.error("Failed to parse AI response:", error.message);
-    return null;
   }
 }
 
 /**
- * Check if Gemini AI is properly configured
- * @returns {Object} Configuration status
+ * Parse a reply that should be an array of per-email results. Accepts a bare
+ * array or an object wrapping it (e.g. {"results": [...]}).
+ * @returns {Array|null}
  */
-function checkAIConfiguration() {
-  const hasApiKey = !!process.env.GEMINI_API_KEY;
+function parseAIResponse(response) {
+  const parsed = extractJSON(response);
+  if (Array.isArray(parsed)) return parsed;
+  if (parsed && typeof parsed === "object") {
+    if (Array.isArray(parsed.results)) return parsed.results;
+    const arrays = Object.values(parsed).filter(Array.isArray);
+    if (arrays.length === 1) return arrays[0];
+    return [parsed];
+  }
+  return null;
+}
+
+// ---------- helpers ----------
+
+function toISODate(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  return isNaN(date.getTime()) ? String(value || "") : date.toISOString();
+}
+
+/**
+ * Plain-text email content for prompts: HTML stripped, whitespace collapsed,
+ * capped at MAX_CONTENT_CHARS so large newsletters don't blow the token budget.
+ */
+function emailContent(email) {
+  let text = String(email.body || email.snippet || "");
+  if (/<[a-z!/][\s\S]*>/i.test(text)) {
+    text = text
+      .replace(/<(style|script|head)[\s\S]*?<\/\1>/gi, " ")
+      .replace(/<br\s*\/?>|<\/(p|div|tr|li|h\d)>/gi, "\n")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/&nbsp;/gi, " ")
+      .replace(/&amp;/gi, "&")
+      .replace(/&lt;/gi, "<")
+      .replace(/&gt;/gi, ">")
+      .replace(/&quot;/gi, '"')
+      .replace(/&#39;|&apos;/gi, "'");
+  }
+  text = text.replace(/[ \t\f\v ]+/g, " ").replace(/\s*\n\s*/g, "\n").trim();
+  return text.length > MAX_CONTENT_CHARS ? `${text.slice(0, MAX_CONTENT_CHARS)} …[truncated]` : text;
+}
+
+function toPromptEmail(email) {
   return {
-    configured: hasApiKey,
-    apiKey: hasApiKey ? "✓ Set" : "✗ Missing",
-    setupInstructions: hasApiKey
-      ? null
-      : "Set GEMINI_API_KEY environment variable or create .env file",
+    id: email.id,
+    subject: email.subject,
+    from: email.from,
+    date: toISODate(email.date),
+    content: emailContent(email),
   };
+}
+
+function findById(results, id) {
+  return (results || []).find((r) => r && String(r.id) === String(id));
+}
+
+function makeBatches(items, size) {
+  const batches = [];
+  for (let i = 0; i < items.length; i += size) batches.push(items.slice(i, i + size));
+  return batches;
+}
+
+/** Errors that will fail every request (bad key, missing deployment, quota) */
+function isFatal(error) {
+  return Boolean(error && (error.fatal || error.quotaExceeded));
+}
+
+function warn(message) {
+  console.warn(chalk.yellow(`⚠️  ${message}`));
 }
 
 /**
@@ -98,67 +191,98 @@ function checkAIConfiguration() {
  * @returns {Promise<Array>} Array of processed results
  */
 async function processBatches(emails, processFn, progressCallback = null) {
-  const config = loadConfig();
-  const batchSize = config.batchSize;
+  const batches = makeBatches(emails, loadConfig().batchSize);
   const results = [];
-  const batches = [];
-
-  // Create batches
-  for (let i = 0; i < emails.length; i += batchSize) {
-    batches.push(emails.slice(i, i + batchSize));
-  }
-
-  // Process each batch
   for (let i = 0; i < batches.length; i++) {
-    if (progressCallback) {
-      progressCallback(i + 1, batches.length);
-    }
-
-    const batchResults = await processFn(batches[i]);
-    results.push(...batchResults);
+    if (progressCallback) progressCallback(i + 1, batches.length);
+    results.push(...(await processFn(batches[i])));
   }
-
   return results;
+}
+
+// ---------- analysis (classification, summary, suggested reply) ----------
+
+const PRIORITIES = ["Urgent", "Important", "Normal"];
+
+function defaultClassification() {
+  return {
+    priority: "Normal",
+    priorityConfidence: 0,
+    type: "Others",
+    actionRequired: false,
+    actionConfidence: 0,
+    actionItems: [],
+  };
+}
+
+function normalizeClassification(result) {
+  const { id, ...rest } = result;
+  const priority = PRIORITIES.find((p) => p.toLowerCase() === String(rest.priority || "").toLowerCase()) || "Normal";
+  return {
+    ...defaultClassification(),
+    ...rest,
+    priority,
+    actionRequired: Boolean(rest.actionRequired),
+    actionItems: Array.isArray(rest.actionItems) ? rest.actionItems : [],
+  };
+}
+
+function defaultSummary(email) {
+  return {
+    summary: [email.snippet || "No summary available"],
+    keyPoints: [],
+    deadlines: [],
+    estimatedReadingTime: 1,
+  };
+}
+
+function normalizeSummary(result) {
+  const { id, ...rest } = result;
+  const asList = (value) => (Array.isArray(value) ? value : value ? [String(value)] : []);
+  return {
+    ...rest,
+    summary: asList(rest.summary),
+    keyPoints: asList(rest.keyPoints),
+    deadlines: asList(rest.deadlines),
+    estimatedReadingTime: Number(rest.estimatedReadingTime) || 1,
+  };
+}
+
+/**
+ * Run one JSON prompt for a batch and map each result back to its email.
+ * Emails the model skipped, or the whole batch on a non-fatal failure,
+ * get the fallback value and are flagged `_aiFailed` (not cached).
+ */
+async function runBatchPrompt(emailBatch, prompt, step, { field, normalize, fallback }) {
+  try {
+    const results = parseAIResponse(await generate(prompt, { json: true }));
+    if (!results) throw new Error("the AI reply was not valid JSON");
+    return emailBatch.map((email) => {
+      const found = findById(results, email.id);
+      return found
+        ? { ...email, [field]: normalize(found) }
+        : { ...email, [field]: fallback(email), _aiFailed: true };
+    });
+  } catch (error) {
+    if (isFatal(error)) throw error;
+    warn(`AI ${step} failed for ${emailBatch.length} email(s): ${error.message}`);
+    return emailBatch.map((email) => ({ ...email, [field]: fallback(email), _aiFailed: true }));
+  }
 }
 
 /**
  * Classify email priority for a batch of emails
  * @param {Array} emailBatch Batch of email objects
- * @returns {Promise<Array>} Array of classification results
+ * @returns {Promise<Array>} Emails with a `classification` field
  */
 async function classifyEmailPriorityBatch(emailBatch) {
-  try {
-    // Prepare batch data for the prompt
-    const emailsData = emailBatch.map((email) => {
-      let dateString;
-      try {
-        if (email.date instanceof Date) {
-          dateString = email.date.toISOString();
-        } else if (typeof email.date === "string") {
-          dateString = email.date;
-        } else {
-          dateString = new Date(email.date).toISOString();
-        }
-      } catch (error) {
-        dateString = new Date().toISOString(); // fallback to current date
-      }
-
-      return {
-        id: email.id,
-        subject: email.subject,
-        from: email.from,
-        date: dateString,
-        content: email.body || email.snippet,
-      };
-    });
-
-    const prompt = `
+  const prompt = `
       Analyze these emails and classify each one's priority as either "Urgent", "Important", or "Normal".
       Also determine if each contains any action items that require a response or action.
-      
+
       Emails:
-      ${JSON.stringify(emailsData, null, 2)}
-      
+      ${JSON.stringify(emailBatch.map(toPromptEmail), null, 2)}
+
       Respond in JSON format only with an array of results, one for each email:
       [
         {
@@ -169,393 +293,166 @@ async function classifyEmailPriorityBatch(emailBatch) {
           "actionRequired": true|false,
           "actionConfidence": <number between 0-100>,
           "actionItems": ["list", "of", "action", "items"]
-        },
-        {
-          "id": "email_id_2",
-          ...
         }
       ]
     `;
-
-    const model = getModel();
-    const result = await model.generateContent(prompt);
-    const response = result.response;
-    const text = response.text();
-
-    console.log("AI Classification Response:", text); // Debug log
-
-    // Use enhanced JSON parsing
-    const classifications = parseAIResponse(text);
-
-    if (classifications && Array.isArray(classifications)) {
-      // Map results back to emails by ID
-      return emailBatch.map((email) => {
-        const classification = classifications.find(
-          (c) => c.id === email.id
-        ) || {
-          priority: "Normal",
-          priorityConfidence: 50,
-          type: "Others",
-          actionRequired: false,
-          actionConfidence: 50,
-          actionItems: [],
-        };
-
-        return {
-          ...email,
-          classification,
-        };
-      });
-    }
-
-    // If JSON parsing fails, provide default classification
-    console.warn("Could not parse AI response, using default classification");
-    return emailBatch.map((email) => ({
-      ...email,
-      classification: {
-        priority: "Normal",
-        priorityConfidence: 50,
-        type: "Others",
-        typeConfidence: 50,
-        requiresAction: false,
-        actionConfidence: 50,
-        actionItems: [],
-      },
-    }));
-  } catch (error) {
-    console.error("Error classifying emails batch:", error);
-    // Return default classification on error
-    return emailBatch.map((email) => ({
-      ...email,
-      classification: {
-        priority: "Normal",
-        priorityConfidence: 50,
-        type: "Others",
-        actionRequired: false,
-        actionConfidence: 50,
-        actionItems: [],
-      },
-    }));
-  }
+  return runBatchPrompt(emailBatch, prompt, "classification", {
+    field: "classification",
+    normalize: normalizeClassification,
+    fallback: defaultClassification,
+  });
 }
 
 /**
  * Generate email summaries for a batch of emails
  * @param {Array} emailBatch Batch of email objects
- * @returns {Promise<Array>} Array of email objects with summaries
+ * @returns {Promise<Array>} Emails with a `summary` field
  */
 async function generateEmailSummaryBatch(emailBatch) {
-  try {
-    // Prepare batch data for the prompt
-    const emailsData = emailBatch.map((email) => {
-      let dateString;
-      try {
-        if (email.date instanceof Date) {
-          dateString = email.date.toISOString();
-        } else if (typeof email.date === "string") {
-          dateString = email.date;
-        } else {
-          dateString = new Date(email.date).toISOString();
-        }
-      } catch (error) {
-        dateString = new Date().toISOString(); // fallback to current date
-      }
-
-      return {
-        id: email.id,
-        subject: email.subject,
-        from: email.from,
-        date: dateString,
-        content: email.body || email.snippet,
-      };
-    });
-
-    const prompt = `
+  const prompt = `
       Summarize each of these emails in bullet points. Extract key points, deadlines, and important information.
-      
+
       Emails:
-      ${JSON.stringify(emailsData, null, 2)}
-      
+      ${JSON.stringify(emailBatch.map(toPromptEmail), null, 2)}
+
       Respond in JSON format only with an array of results, one for each email:
       [
         {
           "id": "email_id_1",
-          "summary": ["bullet point 1", "bullet point 2", ...],
-          "keyPoints": ["key point 1", "key point 2", ...],
-          "deadlines": ["deadline 1", "deadline 2", ...],
+          "summary": ["bullet point 1", "bullet point 2"],
+          "keyPoints": ["key point 1", "key point 2"],
+          "deadlines": ["deadline 1"],
           "estimatedReadingTime": <number in minutes>
-        },
-        {
-          "id": "email_id_2",
-          ...
         }
       ]
     `;
-
-    const model = getModel();
-    const result = await model.generateContent(prompt);
-    const response = result.response;
-    const text = response.text();
-
-    console.log("AI Summary Response:", text); // Debug log
-
-    // Use enhanced JSON parsing
-    const summaries = parseAIResponse(text);
-
-    if (summaries && Array.isArray(summaries)) {
-      // Map results back to emails by ID
-      return emailBatch.map((email) => {
-        const summary = summaries.find((s) => s.id === email.id) || {
-          summary: ["Failed to generate summary"],
-          keyPoints: [],
-          deadlines: [],
-          estimatedReadingTime: 1,
-        };
-
-        return {
-          ...email,
-          summary,
-        };
-      });
-    }
-
-    // If all parsing attempts fail, use default summaries
-    console.warn("Could not parse AI response, using default summaries");
-    return emailBatch.map((email) => ({
-      ...email,
-      summary: {
-        summary: email.snippet || "No summary available",
-        keyPoints: [],
-        actionRequired: false,
-      },
-    }));
-  } catch (error) {
-    console.error("Error generating summaries batch:", error);
-    // Return default summary on error
-    return emailBatch.map((email) => ({
-      ...email,
-      summary: {
-        summary: ["Failed to generate summary"],
-        keyPoints: [],
-        deadlines: [],
-        estimatedReadingTime: 1,
-      },
-    }));
-  }
+  return runBatchPrompt(emailBatch, prompt, "summary", {
+    field: "summary",
+    normalize: normalizeSummary,
+    fallback: defaultSummary,
+  });
 }
 
 /**
  * Generate suggested responses for a batch of emails
  * @param {Array} emailBatch Batch of email objects
- * @returns {Promise<Array>} Array of email objects with suggested responses
+ * @returns {Promise<Array>} Emails with a `suggestedResponse` field
  */
 async function generateSuggestedResponseBatch(emailBatch) {
-  try {
-    // Prepare batch data for the prompt
-    const emailsData = emailBatch.map((email) => {
-      let dateString;
-      try {
-        if (email.date instanceof Date) {
-          dateString = email.date.toISOString();
-        } else if (typeof email.date === "string") {
-          dateString = email.date;
-        } else {
-          dateString = new Date(email.date).toISOString();
-        }
-      } catch (error) {
-        dateString = new Date().toISOString(); // fallback to current date
-      }
-
-      return {
-        id: email.id,
-        subject: email.subject,
-        from: email.from,
-        date: dateString,
-        content: email.body || email.snippet,
-      };
-    });
-
-    const prompt = `
+  const prompt = `
       Generate professional responses to each of these emails. The responses should be concise, address any questions or action items,
       and maintain a professional tone.
-      
+
       Emails:
-      ${JSON.stringify(emailsData, null, 2)}
-      
+      ${JSON.stringify(emailBatch.map(toPromptEmail), null, 2)}
+
       Respond in JSON format only with an array of results, one for each email:
       [
         {
           "id": "email_id_1",
           "suggestedResponse": "Response text here..."
-        },
-        {
-          "id": "email_id_2",
-          ...
         }
       ]
     `;
-
-    const model = getModel();
-    const result = await model.generateContent(prompt);
-    const response = result.response;
-    const text = response.text();
-
-    // Extract JSON from response
-    const jsonMatch = text.match(/\[\s*\{\s*[\s\S]*\}\s*\]/);
-    if (jsonMatch) {
-      const responses = JSON.parse(jsonMatch[0]);
-
-      // Map results back to emails by ID
-      return emailBatch.map((email) => {
-        const responseObj = responses.find((r) => r.id === email.id) || {
-          suggestedResponse: "Failed to generate a suggested response.",
-        };
-
-        return {
-          ...email,
-          suggestedResponse: responseObj.suggestedResponse,
-        };
-      });
-    }
-
-    // If all parsing attempts fail, use default responses
-    console.warn("Could not parse AI response, using default responses");
-    return emailBatch.map((email) => ({
-      ...email,
-      suggestedResponse: "Unable to generate response at this time.",
-    }));
-  } catch (error) {
-    console.error("Error generating responses batch:", error);
-    // Return default response on error
-    return emailBatch.map((email) => ({
-      ...email,
-      suggestedResponse: "Failed to generate a suggested response.",
-    }));
-  }
+  return runBatchPrompt(emailBatch, prompt, "reply suggestion", {
+    field: "suggestedResponse",
+    normalize: (result) => String(result.suggestedResponse || ""),
+    fallback: () => "Unable to generate a response at this time.",
+  });
 }
 
 /**
- * Analyze emails with batching
+ * Analyze emails: classification, summary and suggested reply, in batches
+ * of `batchSize` emails per request. Successful results are cached in
+ * temp/analyzed_cache.json; failed ones are retried on the next run.
  * @param {Array} emails Array of email objects
- * @param {Function} progressCallback Optional callback for progress updates
+ * @param {Function} progressCallback Optional (step, batchNum, totalBatches)
  * @returns {Promise<Array>} Array of analyzed emails
  */
 async function analyzeEmails(emails, progressCallback = null) {
+  const config = loadConfig();
+  const tempDir = path.join(__dirname, "../../", config.tempDir || "./temp");
+  await fs.ensureDir(tempDir);
+
+  const cacheFile = path.join(tempDir, "analyzed_cache.json");
+  let cache = {};
   try {
-    // Check if emails have already been analyzed
-    const config = loadConfig();
-    const tempDir = path.join(__dirname, "../../", config.tempDir || "./temp");
-    await fs.ensureDir(tempDir);
-
-    const cacheFile = path.join(tempDir, "analyzed_cache.json");
-    let cache = {};
-
-    if (await fs.pathExists(cacheFile)) {
-      cache = await fs.readJson(cacheFile);
-    }
-
-    // Filter out emails that have already been analyzed
-    const emailsToAnalyze = emails.filter((email) => !cache[email.id]);
-    const cachedEmails = emails
-      .filter((email) => cache[email.id])
-      .map((email) => cache[email.id]);
-
-    if (emailsToAnalyze.length === 0) {
-      return cachedEmails;
-    }
-
-    // Step 1: Classify emails
-    const classifiedEmails = await processBatches(
-      emailsToAnalyze,
-      classifyEmailPriorityBatch,
-      (batchNum, totalBatches) => {
-        if (progressCallback) {
-          progressCallback("classification", batchNum, totalBatches);
-        }
-      }
-    );
-
-    // Step 2: Generate summaries
-    const summarizedEmails = await processBatches(
-      classifiedEmails,
-      generateEmailSummaryBatch,
-      (batchNum, totalBatches) => {
-        if (progressCallback) {
-          progressCallback("summarization", batchNum, totalBatches);
-        }
-      }
-    );
-
-    // Step 3: Generate suggested responses
-    const analyzedEmails = await processBatches(
-      summarizedEmails,
-      generateSuggestedResponseBatch,
-      (batchNum, totalBatches) => {
-        if (progressCallback) {
-          progressCallback("response generation", batchNum, totalBatches);
-        }
-      }
-    );
-
-    // Update cache
-    analyzedEmails.forEach((email) => {
-      cache[email.id] = email;
-    });
-
-    await fs.writeJson(cacheFile, cache);
-
-    // Combine with cached emails and return
-    return [...analyzedEmails, ...cachedEmails];
-  } catch (error) {
-    console.error("Error analyzing emails:", error);
-    throw error;
+    if (await fs.pathExists(cacheFile)) cache = await fs.readJson(cacheFile);
+  } catch {
+    cache = {}; // unreadable cache: rebuild it
   }
+
+  // Only reuse complete analyses (older caches could hold failed defaults)
+  const isCached = (email) => cache[email.id] && cache[email.id].aiAnalyzed;
+  const emailsToAnalyze = emails.filter((email) => !isCached(email));
+  const cachedEmails = emails.filter(isCached).map((email) => cache[email.id]);
+
+  if (emailsToAnalyze.length === 0) return cachedEmails;
+
+  const progress = (step) => (batchNum, totalBatches) => {
+    if (progressCallback) progressCallback(step, batchNum, totalBatches);
+  };
+
+  const classified = await processBatches(emailsToAnalyze, classifyEmailPriorityBatch, progress("classification"));
+  const summarized = await processBatches(classified, generateEmailSummaryBatch, progress("summarization"));
+  const analyzed = await processBatches(summarized, generateSuggestedResponseBatch, progress("response generation"));
+
+  let failed = 0;
+  const results = analyzed.map(({ _aiFailed, ...email }) => {
+    if (_aiFailed) {
+      failed++;
+      return email;
+    }
+    const complete = { ...email, aiAnalyzed: true };
+    cache[email.id] = complete;
+    return complete;
+  });
+
+  await fs.writeJson(cacheFile, cache);
+  if (failed > 0) {
+    warn(`AI analysis was incomplete for ${failed} email(s); they will be retried on the next analyze.`);
+  }
+  return [...results, ...cachedEmails];
 }
 
+// ---------- calendar events ----------
+
 /**
- * Extract calendar events from email
+ * Extract calendar events from one email
  * @param {Object} email Email object
  * @returns {Promise<Array>} Array of calendar events
  */
 async function extractCalendarEvents(email) {
-  try {
-    const prompt = `
+  const prompt = `
       Extract any date/time-based tasks or meetings from this email. Only extract important dates, not every date mentioned.
       Name the events properly based on context.
-      
+
       Email Subject: ${email.subject}
       From: ${email.from}
-      Date: ${email.date}
-      Content: ${email.body || email.snippet}
-      
+      Date: ${toISODate(email.date)}
+      Content: ${emailContent(email)}
+
       Respond in JSON format only:
       {
         "events": [
           {
             "title": "Event title",
             "date": "YYYY-MM-DD",
-            "time": "HH:MM" (optional),
-            "endTime": "HH:MM" (optional),
+            "time": "HH:MM (optional)",
+            "endTime": "HH:MM (optional)",
             "description": "Brief description of the event"
           }
         ]
       }
     `;
-
-    const model = getModel();
-    const result = await model.generateContent(prompt);
-    const response = result.response;
-    const text = response.text();
-
-    // Extract JSON from response
-    const jsonMatch = text.match(/\\{[\\s\\S]*\\}/);
-    if (jsonMatch) {
-      return JSON.parse(jsonMatch[0]).events || [];
-    }
-
-    throw new Error("Failed to parse AI response");
+  try {
+    const parsed = extractJSON(await generate(prompt, { json: true }));
+    if (parsed && Array.isArray(parsed.events)) return parsed.events;
+    if (Array.isArray(parsed)) return parsed.flatMap((item) => (item && item.events) || []);
+    return [];
   } catch (error) {
-    console.error("Error extracting calendar events:", error);
+    if (isFatal(error)) throw error;
+    warn(`Could not extract calendar events: ${error.message}`);
     return [];
   }
 }
@@ -566,61 +463,19 @@ async function extractCalendarEvents(email) {
  * @param {Function} progressCallback Optional callback for progress updates
  * @returns {Promise<Array>} Array of calendar events
  */
-async function extractCalendarEventsFromEmails(
-  emails,
-  progressCallback = null
-) {
-  try {
-    const config = loadConfig();
-    // Prepare batch data for the prompt with robust date handling
-    const emailsData = emails.map((email) => {
-      let dateString;
-      if (email.date) {
-        if (typeof email.date === "string") {
-          dateString = email.date;
-        } else if (email.date.toISOString) {
-          dateString = email.date.toISOString();
-        } else if (email.date.toString) {
-          dateString = new Date(email.date.toString()).toISOString();
-        } else {
-          dateString = new Date().toISOString(); // fallback
-        }
-      } else {
-        dateString = new Date().toISOString(); // fallback
-      }
+async function extractCalendarEventsFromEmails(emails, progressCallback = null) {
+  const batches = makeBatches(emails.map(toPromptEmail), loadConfig().batchSize);
+  const allEvents = [];
 
-      return {
-        id: email.id,
-        subject: email.subject,
-        from: email.from,
-        date: dateString,
-        content: email.body || email.snippet,
-      };
-    });
-
-    const batchSize = config.batchSize;
-    const allEvents = [];
-    const batches = [];
-
-    // Create batches
-    for (let i = 0; i < emailsData.length; i += batchSize) {
-      batches.push(emailsData.slice(i, i + batchSize));
-    }
-
-    // Process each batch
-    for (let i = 0; i < batches.length; i++) {
-      if (progressCallback) {
-        progressCallback(i + 1, batches.length);
-      }
-
-      const batch = batches[i];
-      const prompt = `
+  for (let i = 0; i < batches.length; i++) {
+    if (progressCallback) progressCallback(i + 1, batches.length);
+    const prompt = `
         Extract any date/time-based tasks or meetings from these emails. Only extract important dates, not every date mentioned.
         Name the events properly based on context.
-        
+
         Emails:
-        ${JSON.stringify(batch, null, 2)}
-        
+        ${JSON.stringify(batches[i], null, 2)}
+
         Respond in JSON format only with an array of results, one for each email:
         [
           {
@@ -629,344 +484,166 @@ async function extractCalendarEventsFromEmails(
               {
                 "title": "Event title",
                 "date": "YYYY-MM-DD",
-                "time": "HH:MM" (optional),
-                "endTime": "HH:MM" (optional),
+                "time": "HH:MM (optional)",
+                "endTime": "HH:MM (optional)",
                 "description": "Brief description of the event"
               }
             ]
-          },
-          {
-            "id": "email_id_2",
-            ...
           }
         ]
       `;
-
-      const model = getModel();
-      const result = await model.generateContent(prompt);
-      const response = result.response;
-      const text = response.text();
-
-      // Extract JSON from response
-      const jsonMatch = text.match(/\\[\\s*\\{[\\s\\S]*\\}\\s*\\]/);
-      if (jsonMatch) {
-        const batchResults = JSON.parse(jsonMatch[0]);
-
-        // Collect all events
-        batchResults.forEach((item) => {
-          if (item.events && item.events.length > 0) {
-            allEvents.push(...item.events);
-          }
-        });
-      }
+    try {
+      const results = parseAIResponse(await generate(prompt, { json: true })) || [];
+      results.forEach((item) => {
+        if (item && Array.isArray(item.events)) allEvents.push(...item.events);
+      });
+    } catch (error) {
+      if (isFatal(error)) throw error;
+      warn(`Could not extract calendar events from batch ${i + 1}: ${error.message}`);
     }
-
-    return allEvents;
-  } catch (error) {
-    console.error("Error extracting calendar events from emails:", error);
-    return [];
   }
+  return allEvents;
+}
+
+// ---------- search ----------
+
+function simpleTextSearch(emails, query) {
+  const q = query.toLowerCase();
+  return emails.filter((email) =>
+    [email.subject, email.from, email.snippet].some((field) => String(field || "").toLowerCase().includes(q))
+  );
 }
 
 /**
- * Search emails with natural language query
+ * Search emails with a natural language query (falls back to plain text search)
  * @param {Array} emails Array of email objects
  * @param {string} query Natural language query
  * @returns {Promise<Array>} Array of matching emails
  */
 async function searchEmailsWithNLP(emails, query) {
-  try {
-    // Check if API key is available
-    if (!process.env.GEMINI_API_KEY) {
-      console.log(
-        "⚠️  No Gemini API key found. Using simple text search instead."
-      );
-      const lowerQuery = query.toLowerCase();
-      return emails.filter(
-        (email) =>
-          email.subject.toLowerCase().includes(lowerQuery) ||
-          email.from.toLowerCase().includes(lowerQuery) ||
-          (email.snippet && email.snippet.toLowerCase().includes(lowerQuery))
-      );
-    }
+  if (!getProviderInfo().configured) {
+    console.log("⚠️  No AI provider configured. Using simple text search instead.");
+    return simpleTextSearch(emails, query);
+  }
 
-    const emailsJson = JSON.stringify(
-      emails.map((email) => ({
-        id: email.id,
-        subject: email.subject,
-        from: email.from,
-        date:
-          email.date instanceof Date ? email.date.toISOString() : email.date,
-        snippet: email.snippet,
-      }))
-    );
+  const emailsJson = JSON.stringify(
+    emails.map((email) => ({
+      id: email.id,
+      subject: email.subject,
+      from: email.from,
+      date: toISODate(email.date),
+      snippet: email.snippet,
+    }))
+  );
 
-    const prompt = `
+  const prompt = `
       I have a list of emails and a search query. Find emails that match the query.
-      
+      Today's date is ${new Date().toISOString().slice(0, 10)}.
+
       Search query: "${query}"
-      
+
       Emails:
       ${emailsJson}
-      
+
       Return the IDs of matching emails in JSON format:
       {
-        "matchingIds": ["id1", "id2", ...]
+        "matchingIds": ["id1", "id2"]
       }
-      
+
       Be flexible in interpreting the query. For example, "last month" should match emails from the previous month,
       "urgent" should match emails that seem urgent even if they don't contain that exact word.
     `;
 
-    const model = getModel();
-
-    // Retry logic for temporary failures
-    let lastError;
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      try {
-        const result = await model.generateContent(prompt);
-        const response = result.response;
-        const text = response.text();
-
-        console.log("AI Search Response:", text); // Debug log
-
-        // Try to extract JSON from response with better regex
-        let jsonMatch = text.match(/\{[^{}]*"matchingIds"[^{}]*\}/);
-
-        if (!jsonMatch) {
-          // Try alternative patterns
-          jsonMatch = text.match(/\{[\s\S]*?\}/);
-        }
-
-        if (jsonMatch) {
-          try {
-            const parsedResponse = JSON.parse(jsonMatch[0]);
-            const matchingIds = parsedResponse.matchingIds || [];
-            return emails.filter((email) => matchingIds.includes(email.id));
-          } catch (parseError) {
-            console.error("JSON Parse Error:", parseError);
-            console.error("Raw JSON:", jsonMatch[0]);
-
-            // Fallback: simple text search if AI parsing fails
-            const lowerQuery = query.toLowerCase();
-            return emails.filter(
-              (email) =>
-                email.subject.toLowerCase().includes(lowerQuery) ||
-                email.from.toLowerCase().includes(lowerQuery) ||
-                (email.snippet &&
-                  email.snippet.toLowerCase().includes(lowerQuery))
-            );
-          }
-        }
-
-        // Fallback: simple text search if no JSON found
-        console.log("No JSON found in AI response, using fallback search");
-        const lowerQuery = query.toLowerCase();
-        return emails.filter(
-          (email) =>
-            email.subject.toLowerCase().includes(lowerQuery) ||
-            email.from.toLowerCase().includes(lowerQuery) ||
-            (email.snippet && email.snippet.toLowerCase().includes(lowerQuery))
-        );
-      } catch (error) {
-        lastError = error;
-
-        if (error.status === 503 && attempt < 3) {
-          console.log(
-            `🔄 API overloaded, retrying in ${
-              attempt * 2
-            } seconds... (attempt ${attempt}/3)`
-          );
-          await new Promise((resolve) => setTimeout(resolve, attempt * 2000));
-          continue;
-        }
-
-        // If not a retry-able error or max attempts reached, break
-        break;
-      }
-    }
-
-    // If we get here, all attempts failed
-    throw lastError;
+  try {
+    const parsed = extractJSON(await generate(prompt, { json: true }));
+    const ids = parsed && (parsed.matchingIds || (parsed.results && parsed.results.matchingIds));
+    if (!Array.isArray(ids)) throw new Error("the AI reply had no matchingIds");
+    const wanted = new Set(ids.map(String));
+    return emails.filter((email) => wanted.has(String(email.id)));
   } catch (error) {
-    console.error("Error searching emails:", error);
-
-    // Provide more specific error messages
-    if (error.message.includes("fetch failed")) {
-      console.log(
-        "🌐 Network error: Unable to connect to Gemini AI. Using text search fallback."
-      );
-    } else if (error.message.includes("API key")) {
-      console.log(
-        "🔑 API key error: Invalid or missing Gemini API key. Using text search fallback."
-      );
-    } else if (error.message.includes("quota")) {
-      console.log(
-        "📊 Quota exceeded: Gemini API quota limit reached. Using text search fallback."
-      );
-    } else {
-      console.log("⚠️  AI search failed. Using simple text search fallback.");
-    }
-
-    // Final fallback: simple text search
-    const lowerQuery = query.toLowerCase();
-    return emails.filter(
-      (email) =>
-        email.subject.toLowerCase().includes(lowerQuery) ||
-        email.from.toLowerCase().includes(lowerQuery) ||
-        (email.snippet && email.snippet.toLowerCase().includes(lowerQuery))
-    );
+    console.log(chalk.yellow(`⚠️  AI search failed (${error.message}). Using simple text search.`));
+    return simpleTextSearch(emails, query);
   }
 }
+
+// ---------- tags, sentiment, follow-up ----------
 
 /**
  * Auto-tag emails with custom labels
  * @param {Array} emails Array of email objects
  * @param {Function} progressCallback Optional callback for progress updates
- * @returns {Promise<Array>} Array of emails with tags
+ * @returns {Promise<Array>} Emails with a `tags` field
  */
 async function autoTagEmails(emails, progressCallback = null) {
-  try {
-    const batchSize = config.batchSize;
-    const taggedEmails = [];
-    const batches = [];
+  const tagged = [];
+  const batches = makeBatches(emails, loadConfig().batchSize);
 
-    // Create batches
-    for (let i = 0; i < emails.length; i += batchSize) {
-      batches.push(emails.slice(i, i + batchSize));
-    }
-
-    // Process each batch
-    for (let i = 0; i < batches.length; i++) {
-      if (progressCallback) {
-        progressCallback(i + 1, batches.length);
-      }
-
-      const batch = batches[i];
-      const emailsData = batch.map((email) => ({
-        id: email.id,
-        subject: email.subject,
-        from: email.from,
-        date: email.date.toISOString(),
-        content: email.body || email.snippet,
-      }));
-
-      const prompt = `
+  for (let i = 0; i < batches.length; i++) {
+    if (progressCallback) progressCallback(i + 1, batches.length);
+    const batch = batches[i];
+    const prompt = `
         Based on the content of these emails, suggest appropriate labels/tags from the following options:
         - Invoices
         - Leads
         - Personal
         - Projects
         - Follow-up
-        
+
         You can suggest multiple labels if appropriate.
-        
+
         Emails:
-        ${JSON.stringify(emailsData, null, 2)}
-        
+        ${JSON.stringify(batch.map(toPromptEmail), null, 2)}
+
         Respond in JSON format only with an array of results, one for each email:
         [
           {
             "id": "email_id_1",
-            "tags": ["tag1", "tag2", ...],
+            "tags": ["tag1", "tag2"],
             "confidence": <number between 0-100>
-          },
-          {
-            "id": "email_id_2",
-            ...
           }
         ]
       `;
-
-      const model = getModel();
-      const result = await model.generateContent(prompt);
-      const response = result.response;
-      const text = response.text();
-
-      // Extract JSON from response
-      const jsonMatch = text.match(/\\[\\s*\\{[\\s\\S]*\\}\\s*\\]/);
-      if (jsonMatch) {
-        const tagsResults = JSON.parse(jsonMatch[0]);
-
-        // Map results back to emails by ID
-        batch.forEach((email) => {
-          const tagsResult = tagsResults.find((t) => t.id === email.id) || {
-            tags: [],
-            confidence: 0,
-          };
-
-          taggedEmails.push({
-            ...email,
-            tags: tagsResult,
-          });
-        });
-      } else {
-        // Return default tags on error
-        batch.forEach((email) => {
-          taggedEmails.push({
-            ...email,
-            tags: {
-              tags: [],
-              confidence: 0,
-            },
-          });
-        });
-      }
+    let results = [];
+    try {
+      results = parseAIResponse(await generate(prompt, { json: true })) || [];
+    } catch (error) {
+      if (isFatal(error)) throw error;
+      warn(`Auto-tagging failed for batch ${i + 1}: ${error.message}`);
     }
-
-    return taggedEmails;
-  } catch (error) {
-    console.error("Error auto-tagging emails:", error);
-    // Return default tags on error
-    return emails.map((email) => ({
-      ...email,
-      tags: {
-        tags: [],
-        confidence: 0,
-      },
-    }));
+    batch.forEach((email) => {
+      const found = findById(results, email.id);
+      tagged.push({
+        ...email,
+        tags: found
+          ? { tags: Array.isArray(found.tags) ? found.tags : [], confidence: Number(found.confidence) || 0 }
+          : { tags: [], confidence: 0 },
+      });
+    });
   }
+  return tagged;
 }
 
 /**
- * Generate email sentiment analysis
+ * Sentiment analysis for emails
  * @param {Array} emails Array of email objects
  * @param {Function} progressCallback Optional callback for progress updates
- * @returns {Promise<Array>} Array of sentiment analysis results
+ * @returns {Promise<Array>} One sentiment result per email
  */
 async function analyzeEmailSentiment(emails, progressCallback = null) {
-  try {
-    const batchSize = config.batchSize;
-    const sentimentResults = [];
-    const batches = [];
+  const neutral = (email) => ({ id: email.id, sentiment: "neutral", sentimentScore: 0, type: "other", stressLevel: 5 });
+  const results = [];
+  const batches = makeBatches(emails, loadConfig().batchSize);
 
-    // Create batches
-    for (let i = 0; i < emails.length; i += batchSize) {
-      batches.push(emails.slice(i, i + batchSize));
-    }
-
-    // Process each batch
-    for (let i = 0; i < batches.length; i++) {
-      if (progressCallback) {
-        progressCallback(i + 1, batches.length);
-      }
-
-      const batch = batches[i];
-      const emailsData = batch.map((email) => ({
-        id: email.id,
-        subject: email.subject,
-        from: email.from,
-        date: email.date.toISOString(),
-        content: email.body || email.snippet,
-      }));
-
-      const prompt = `
+  for (let i = 0; i < batches.length; i++) {
+    if (progressCallback) progressCallback(i + 1, batches.length);
+    const batch = batches[i];
+    const prompt = `
         Analyze the sentiment of these emails. Determine if each is positive, negative, or neutral.
         Also identify if each is an appreciation, complaint, or request.
-        
+
         Emails:
-        ${JSON.stringify(emailsData, null, 2)}
-        
+        ${JSON.stringify(batch.map(toPromptEmail), null, 2)}
+
         Respond in JSON format only with an array of results, one for each email:
         [
           {
@@ -975,82 +652,45 @@ async function analyzeEmailSentiment(emails, progressCallback = null) {
             "sentimentScore": <number between -1 and 1>,
             "type": "appreciation|complaint|request|information|other",
             "stressLevel": <number between 0-10>
-          },
-          {
-            "id": "email_id_2",
-            ...
           }
         ]
       `;
-
-      const model = getModel();
-      const result = await model.generateContent(prompt);
-      const response = result.response;
-      const text = response.text();
-
-      // Extract JSON from response
-      const jsonMatch = text.match(/\\[\\s*\\{[\\s\\S]*\\}\\s*\\]/);
-      if (jsonMatch) {
-        const batchResults = JSON.parse(jsonMatch[0]);
-        sentimentResults.push(...batchResults);
-      }
+    let parsed = [];
+    try {
+      parsed = parseAIResponse(await generate(prompt, { json: true })) || [];
+    } catch (error) {
+      if (isFatal(error)) throw error;
+      warn(`Sentiment analysis failed for batch ${i + 1}: ${error.message}`);
     }
-
-    return sentimentResults;
-  } catch (error) {
-    console.error("Error analyzing email sentiment:", error);
-    return emails.map((email) => ({
-      id: email.id,
-      sentiment: "neutral",
-      sentimentScore: 0,
-      type: "other",
-      stressLevel: 5,
-    }));
+    batch.forEach((email) => results.push(findById(parsed, email.id) || neutral(email)));
   }
+  return results;
 }
 
 /**
  * Check if emails need follow-up
  * @param {Array} emails Array of email objects
  * @param {Function} progressCallback Optional callback for progress updates
- * @returns {Promise<Array>} Array of emails with follow-up information
+ * @returns {Promise<Array>} Emails with a `followUp` field
  */
 async function checkNeedsFollowUp(emails, progressCallback = null) {
-  try {
-    const batchSize = config.batchSize;
-    const followUpResults = [];
-    const batches = [];
+  const noFollowUp = { needsFollowUp: false, confidence: 0, reason: "Could not analyze email", suggestedFollowUp: "" };
+  const results = [];
+  const batches = makeBatches(emails, loadConfig().batchSize);
 
-    // Create batches
-    for (let i = 0; i < emails.length; i += batchSize) {
-      batches.push(emails.slice(i, i + batchSize));
-    }
-
-    // Process each batch
-    for (let i = 0; i < batches.length; i++) {
-      if (progressCallback) {
-        progressCallback(i + 1, batches.length);
-      }
-
-      const batch = batches[i];
-      const emailsData = batch.map((email) => ({
-        id: email.id,
-        subject: email.subject,
-        from: email.from,
-        date: email.date.toISOString(),
-        content: email.body || email.snippet,
-      }));
-
-      const prompt = `
+  for (let i = 0; i < batches.length; i++) {
+    if (progressCallback) progressCallback(i + 1, batches.length);
+    const batch = batches[i];
+    const prompt = `
         Analyze these emails and determine if each requires a follow-up response.
         Consider factors like:
         - Does it contain questions that need answers?
         - Does it request information or action?
         - Does the tone suggest an expectation of response?
-        
+
         Emails:
-        ${JSON.stringify(emailsData, null, 2)}
-        
+        ${JSON.stringify(batch.map(toPromptEmail), null, 2)}
+
         Respond in JSON format only with an array of results, one for each email:
         [
           {
@@ -1059,118 +699,65 @@ async function checkNeedsFollowUp(emails, progressCallback = null) {
             "confidence": <number between 0-100>,
             "reason": "brief explanation",
             "suggestedFollowUp": "suggested follow-up message"
-          },
-          {
-            "id": "email_id_2",
-            ...
           }
         ]
       `;
-
-      const model = getModel();
-      const result = await model.generateContent(prompt);
-      const response = result.response;
-      const text = response.text();
-
-      // Extract JSON from response
-      const jsonMatch = text.match(/\\[\\s*\\{[\\s\\S]*\\}\\s*\\]/);
-      if (jsonMatch) {
-        const batchResults = JSON.parse(jsonMatch[0]);
-
-        // Map results back to emails
-        batch.forEach((email) => {
-          const followUpResult = batchResults.find(
-            (r) => r.id === email.id
-          ) || {
-            needsFollowUp: false,
-            confidence: 0,
-            reason: "Error analyzing email",
-            suggestedFollowUp: "",
-          };
-
-          followUpResults.push({
-            ...email,
-            followUp: followUpResult,
-          });
-        });
-      } else {
-        // Return default follow-up info on error
-        batch.forEach((email) => {
-          followUpResults.push({
-            ...email,
-            followUp: {
-              needsFollowUp: false,
-              confidence: 0,
-              reason: "Error analyzing email",
-              suggestedFollowUp: "",
-            },
-          });
-        });
-      }
+    let parsed = [];
+    try {
+      parsed = parseAIResponse(await generate(prompt, { json: true })) || [];
+    } catch (error) {
+      if (isFatal(error)) throw error;
+      warn(`Follow-up check failed for batch ${i + 1}: ${error.message}`);
     }
-
-    return followUpResults;
-  } catch (error) {
-    console.error("Error checking follow-up need:", error);
-    return emails.map((email) => ({
-      ...email,
-      followUp: {
-        needsFollowUp: false,
-        confidence: 0,
-        reason: "Error analyzing email",
-        suggestedFollowUp: "",
-      },
-    }));
+    batch.forEach((email) => {
+      const found = findById(parsed, email.id);
+      const { id, ...followUp } = found || {};
+      results.push({ ...email, followUp: found ? { ...noFollowUp, ...followUp } : noFollowUp });
+    });
   }
+  return results;
 }
 
+// ---------- reply drafts ----------
+
 /**
- * Generate full email reply draft
+ * Generate a full email reply draft
  * @param {Object} email Email object
- * @returns {Promise<string>} Full email reply draft
+ * @returns {Promise<string>} Reply draft text
  */
 async function generateFullReplyDraft(email) {
-  try {
-    const prompt = `
+  const prompt = `
       Generate a full professional reply draft for this email, including greeting, body, and closing.
       The reply should reflect the appropriate urgency, tone (friendly or formal based on context),
       and address all questions or expected outcomes mentioned.
-      
+
       Email Subject: ${email.subject}
       From: ${email.from}
-      Date: ${email.date}
-      Content: ${email.body || email.snippet}
-      
+      Date: ${toISODate(email.date)}
+      Content: ${emailContent(email)}
+
       Generate only the reply text, without any additional formatting or explanation.
     `;
-
-    const model = getModel();
-    const result = await model.generateContent(prompt);
-    const response = result.response;
-    return response.text();
+  try {
+    return (await generate(prompt)).trim();
   } catch (error) {
-    console.error("Error generating reply draft:", error);
+    console.error(chalk.red(`Error generating reply draft: ${error.message}`));
     return "Failed to generate a reply draft.";
   }
 }
 
+// ---------- config ----------
+
 /**
  * Update configuration
- * @param {Object} newConfig New configuration object
+ * @param {Object} newConfig New configuration values
  * @returns {Promise<Object>} Updated configuration
  */
 async function updateConfig(newConfig) {
-  try {
-    const configPath = path.join(__dirname, "../../config.json");
-    const currentConfig = loadConfig();
-    const updatedConfig = { ...currentConfig, ...newConfig };
-    await fs.writeJson(configPath, updatedConfig, { spaces: 2 });
-
-    return updatedConfig;
-  } catch (error) {
-    console.error("Error updating configuration:", error);
-    throw error;
-  }
+  const configPath = path.join(__dirname, "../../config.json");
+  const updatedConfig = { ...loadConfig(), ...newConfig };
+  await fs.writeJson(configPath, updatedConfig, { spaces: 2 });
+  return updatedConfig;
 }
 
 /**
@@ -1194,6 +781,7 @@ module.exports = {
   getConfig,
   checkAIConfiguration,
   parseAIResponse,
+  extractJSON,
   classifyEmailPriorityBatch,
   generateEmailSummaryBatch,
 };

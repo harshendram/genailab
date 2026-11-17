@@ -215,8 +215,25 @@ npm install
 # Env setup
 cp .env.sample .env
 # Add keys to .env
-npm install -g .
+npm install -g .   # or: npm link
 ```
+
+After installing globally, `emailmaster` works from any folder: it always reads
+`credentials.json`, `.env`, `tokens/` and its cache from the install folder. File
+paths you type yourself (`--file`, `-o`) are relative to the folder you're in.
+
+---
+
+### 💬 Interactive Shell
+
+Run `emailmaster` with no arguments to open an interactive prompt:
+
+- Type `/` to browse commands. Keep typing to filter, use `↑`/`↓` to pick, `Tab` to complete and `Enter` to run.
+- Type a plain question, such as `invoices from last week`, to search your emails with AI.
+- Run `/help` to see every command; add `--help` to a command for its options, e.g. `/fetch --help`.
+- `↑`/`↓` on an empty prompt walks your command history. `/exit` or `Ctrl+C` twice quits.
+
+Every command still works directly too, e.g. `emailmaster fetch --max 10`.
 
 ---
 
@@ -227,11 +244,14 @@ npm install -g .
 1. Google Cloud Console → Enable Gmail API → OAuth 2.0 Desktop Client
 2. Save `credentials.json` to root.
 
-#### Gemini AI API
+#### AI provider (Azure OpenAI or Gemini)
 
-1. Google AI Studio → Get API Key.
-2. Add to `.env`
-   `GEMINI_API_KEY=your_api_key_here`
+EmailMaster uses **Azure OpenAI** when `AZURE_OPENAI_API_KEY` is set, and **Google Gemini** otherwise.
+
+- **Azure OpenAI**: add `AZURE_OPENAI_API_KEY` and `AZURE_OPENAI_ENDPOINT` (`https://<resource>.openai.azure.com/openai/v1`) to `.env`. The default deployment is `gpt-5.4-mini`.
+- **Gemini**: Google AI Studio → Get API Key, then add `GEMINI_API_KEY=your_api_key_here` to `.env`. The free tier allows only a few requests per minute; EmailMaster paces and retries automatically.
+
+`emailmaster config --list-models` shows what your key can use; `emailmaster config --model <name>` switches.
 
 ---
 
